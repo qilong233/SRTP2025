@@ -1,0 +1,567 @@
+文件：flow2.ino
+代码：
+#include "MPU6050_handler.h"
+#include "NeoPixel_handler.h"
+
+// 创建全局对象
+MPU6050Handler mpuHandler;
+NeoPixelHandler pixelHandler;
+
+// 状态跟踪变量
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL = 150; // 读取间隔(ms)
+int resetCount = 0;
+const int MAX_RESETS = 5; // 最大复位次数
+
+// ===== 可配置参数 - 加速度阈值和速度因子 =====
+// 这些参数可以方便地调整以适应不同的需求
+
+// 加速度阈值配置
+const float ACCEL_THRESHOLD_LOW = 1.5;    // 开始加速的阈值 (m/s²)
+const float ACCEL_THRESHOLD_HIGH = 5;  // 最大加速度阈值 (m/s²)
+
+// 减速度阈值配置
+const float DECEL_THRESHOLD_LOW = -1.5;   // 开始减速的阈值 (m/s²)
+const float DECEL_THRESHOLD_HIGH = -5; // 最大减速度阈值 (m/s²)
+
+// 速度因子配置
+const float MIN_SPEED_FACTOR = 1.0;       // 最小速度因子
+const float MAX_SPEED_FACTOR = 3.0;       // 最大速度因子
+const float REVERSE_SLOW_FACTOR = 0.7;    // 反向流动速度降低因子
+
+// ===== 参数配置结束 =====
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+  
+  // 初始化传感器和灯条
+  if (!mpuHandler.init()) {
+    Serial.println("MPU6050 initialization failed!");
+    while(1); // 停止执行
+  }
+  pixelHandler.init();
+  
+  // 打印当前配置参数
+  Serial.println("MPU6050 with Kalman Filter and Zero Drift Correction");
+  Serial.println("=== 当前配置参数 ===");
+  Serial.print("加速度阈值: "); Serial.print(ACCEL_THRESHOLD_LOW); 
+  Serial.print(" 到 "); Serial.println(ACCEL_THRESHOLD_HIGH);
+  Serial.print("减速度阈值: "); Serial.print(DECEL_THRESHOLD_LOW); 
+  Serial.print(" 到 "); Serial.println(DECEL_THRESHOLD_HIGH);
+  Serial.print("速度因子范围: "); Serial.print(MIN_SPEED_FACTOR); 
+  Serial.print(" 到 "); Serial.println(MAX_SPEED_FACTOR);
+  Serial.print("反向减速因子: "); Serial.println(REVERSE_SLOW_FACTOR);
+  Serial.println("====================");
+  Serial.println("Acceleration (m/s²)\t\tGyroscope (deg/s)");
+  Serial.println("X\t\tY\t\tZ\t\tX\t\tY\t\tZ\tTemp(°C)\tSpeed\tDirection");
+}
+
+void loop() {
+  // 检查是否到达读取间隔
+  if (millis() - lastReadTime < READ_INTERVAL) {
+    pixelHandler.update(); // 继续更新灯条
+    return;
+  }
+  lastReadTime = millis();
+  
+  // 读取传感器数据
+  SensorData data;
+  bool readSuccess = mpuHandler.readData(data);
+  
+  // 检查数据有效性
+  if (!readSuccess || 
+      (data.accelX == 0 && data.accelY == 0 && data.accelZ == 0) ||
+      (data.gyroX == 0 && data.gyroY == 0 && data.gyroZ == 0)) {
+    
+    Serial.print("Invalid data! Attempting recovery... ");
+    resetCount++;
+    
+    if (resetCount > MAX_RESETS) {
+      Serial.println("Critical failure! Please reset Arduino.");
+      while(1); // 永久停止
+    }
+    
+    // 尝试软复位
+    Serial.print("Reset ");
+    Serial.println(resetCount);
+    mpuHandler.recoverSensor();
+    return;
+  }
+  
+  // 重置错误计数器
+  resetCount = 0;
+  
+  // 根据X轴加速度调整灯条速度和方向
+  float speedFactor = MIN_SPEED_FACTOR;
+  int direction = 1; // 1表示正向，-1表示反向
+  
+  if (data.accelX > ACCEL_THRESHOLD_LOW) {
+    // 加速状态：正向流动，速度增加
+    // 计算速度系数 (从阈值到最大阈值映射到最小到最大速度因子)
+    float accelRange = ACCEL_THRESHOLD_HIGH - ACCEL_THRESHOLD_LOW;
+    float speedRange = MAX_SPEED_FACTOR - MIN_SPEED_FACTOR;
+    float normalizedAccel = min(data.accelX - ACCEL_THRESHOLD_LOW, accelRange);
+    speedFactor = MIN_SPEED_FACTOR + (normalizedAccel / accelRange) * speedRange;
+    direction = 1;
+  } else if (data.accelX < DECEL_THRESHOLD_LOW) {
+    // 减速状态：反向流动，速度增加
+    // 使用绝对值计算速度因子
+    float decelRange = abs(DECEL_THRESHOLD_HIGH - DECEL_THRESHOLD_LOW);
+    float speedRange = MAX_SPEED_FACTOR - MIN_SPEED_FACTOR;
+    float normalizedDecel = min(abs(data.accelX) - abs(DECEL_THRESHOLD_LOW), decelRange);
+    speedFactor = MIN_SPEED_FACTOR + (normalizedDecel / decelRange) * speedRange;
+    direction = -1;
+  } else {
+    // 正常状态：正向流动，默认速度
+    speedFactor = MIN_SPEED_FACTOR;
+    direction = 1;
+  }
+  
+  pixelHandler.setSpeedFactor(speedFactor);
+  pixelHandler.setDirection(direction);
+  
+  // 输出处理后的数据
+  Serial.print(data.accelX, 2); Serial.print("\t\t");
+  Serial.print(data.accelY, 2); Serial.print("\t\t");
+  Serial.print(data.accelZ, 2); Serial.print("\t\t");
+  
+  Serial.print(data.gyroX, 1); Serial.print("\t\t");
+  Serial.print(data.gyroY, 1); Serial.print("\t\t");
+  Serial.print(data.gyroZ, 1); Serial.print("\t\t");
+  
+  Serial.print(data.temperature, 1); Serial.print("\t\t");
+  
+  // 添加灯条速度显示
+  Serial.print(speedFactor, 2); Serial.print("\t");
+  
+  // 添加灯条方向显示
+  Serial.print(direction == 1 ? "Forward" : "Reverse");
+  
+  Serial.println();  // 换行
+  
+  // 更新灯条效果
+  pixelHandler.update();
+}
+
+文件：MPU6050_handler.cpp
+代码：#include "MPU6050_handler.h"
+
+MPU6050Handler::MPU6050Handler() : isCalibrated(false) {
+  // 初始化偏移量为0
+  for (int i = 0; i < 3; i++) {
+    accel_offset[i] = 0;
+    gyro_offset[i] = 0;
+  }
+}
+
+bool MPU6050Handler::init() {
+  Serial.println("Initializing MPU6050...");
+  
+  // 尝试初始化MPU6050
+  bool initialized = false;
+  for (int i = 0; i < 3; i++) {
+    Wire.begin(); // 重置I2C总线
+    delay(50);
+    
+    if (mpu.begin()) {
+      initialized = true;
+      break;
+    }
+    Serial.print("Init failed, retrying... (");
+    Serial.print(i+1);
+    Serial.println("/3)");
+    delay(300);
+  }
+  
+  if (!initialized) {
+    Serial.println("MPU6050 initialization failed!");
+    return false;
+  }
+  
+  // 配置传感器设置
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  
+  initKalmanFilters();
+  calibrate();
+  
+  Serial.println("MPU6050 Ready!");
+  return true;
+}
+
+void MPU6050Handler::initKalmanFilters() {
+  // 初始化卡尔曼滤波器参数
+  for (int i = 0; i < 3; i++) {
+    // 加速度计滤波器参数
+    accel_filter[i].Q = 0.01;
+    accel_filter[i].R = 0.1;
+    accel_filter[i].P = 1.0;
+    accel_filter[i].K = 0.0;
+    accel_filter[i].X = 0.0;
+    
+    // 陀螺仪滤波器参数
+    gyro_filter[i].Q = 0.005;
+    gyro_filter[i].R = 0.05;
+    gyro_filter[i].P = 1.0;
+    gyro_filter[i].K = 0.0;
+    gyro_filter[i].X = 0.0;
+  }
+}
+
+void MPU6050Handler::calibrate() {
+  Serial.println("Calibrating sensor... Please keep the sensor stationary!");
+  
+  float accel_sum[3] = {0, 0, 0};
+  float gyro_sum[3] = {0, 0, 0};
+  int valid_samples = 0;
+  
+  // 收集校准数据
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    sensors_event_t accel, gyro, temp;
+    
+    if (mpu.getEvent(&accel, &gyro, &temp)) {
+      // 累加陀螺仪数据用于零点校正
+      gyro_sum[0] += gyro.gyro.x;
+      gyro_sum[1] += gyro.gyro.y;
+      gyro_sum[2] += gyro.gyro.z;
+      
+      // 累加加速度数据，但保留重力分量
+      accel_sum[0] += accel.acceleration.x;
+      accel_sum[1] += accel.acceleration.y;
+      accel_sum[2] += accel.acceleration.z;
+      
+      valid_samples++;
+      
+      if (i % 50 == 0) {
+        Serial.print("Calibration progress: ");
+        Serial.print((i * 100) / CALIBRATION_SAMPLES);
+        Serial.println("%");
+      }
+    }
+    delay(10);
+  }
+  
+  if (valid_samples > 0) {
+    // 计算陀螺仪偏移量 (应该为0)
+    gyro_offset[0] = gyro_sum[0] / valid_samples;
+    gyro_offset[1] = gyro_sum[1] / valid_samples;
+    gyro_offset[2] = gyro_sum[2] / valid_samples;
+    
+    // 计算加速度偏移量，但保持重力分量
+    // 假设校准时Z轴向上，应该有约9.8m/s²的重力
+    accel_offset[0] = accel_sum[0] / valid_samples; // X轴偏移
+    accel_offset[1] = accel_sum[1] / valid_samples; // Y轴偏移
+    // Z轴：移除偏移但保留重力 (期望值为9.8，实际测量值减去9.8就是偏移)
+    accel_offset[2] = (accel_sum[2] / valid_samples) - 9.8;
+    
+    isCalibrated = true;
+    
+    Serial.println("Calibration complete!");
+    Serial.print("Gyro offsets: ");
+    Serial.print(gyro_offset[0] * 57.2958, 3); Serial.print(", ");
+    Serial.print(gyro_offset[1] * 57.2958, 3); Serial.print(", ");
+    Serial.print(gyro_offset[2] * 57.2958, 3); Serial.println(" deg/s");
+    
+    Serial.print("Accel offsets: ");
+    Serial.print(accel_offset[0], 3); Serial.print(", ");
+    Serial.print(accel_offset[1], 3); Serial.print(", ");
+    Serial.print(accel_offset[2], 3); Serial.println(" m/s²");
+  } else {
+    Serial.println("Calibration failed!");
+  }
+}
+
+bool MPU6050Handler::readData(SensorData &data) {
+  // 创建传感器事件对象
+  sensors_event_t accel, gyro, temp;
+  
+  // 尝试读取传感器数据
+  bool readSuccess = false;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (mpu.getEvent(&accel, &gyro, &temp)) {
+      readSuccess = true;
+      break;
+    }
+    delay(10); // 短暂延迟后重试
+  }
+  
+  if (!readSuccess) {
+    return false;
+  }
+  
+  // 应用零漂校正和卡尔曼滤波
+  float corrected_accel[3], corrected_gyro[3];
+  
+  if (isCalibrated) {
+    // 零漂校正 - 加速度保留重力分量
+    corrected_accel[0] = accel.acceleration.x - accel_offset[0];
+    corrected_accel[1] = accel.acceleration.y - accel_offset[1];
+    corrected_accel[2] = accel.acceleration.z - accel_offset[2]; // 包含重力
+    
+    // 零漂校正 - 陀螺仪
+    corrected_gyro[0] = (gyro.gyro.x - gyro_offset[0]) * 57.2958; // 转换为度/秒
+    corrected_gyro[1] = (gyro.gyro.y - gyro_offset[1]) * 57.2958;
+    corrected_gyro[2] = (gyro.gyro.z - gyro_offset[2]) * 57.2958;
+    
+    // 应用卡尔曼滤波
+    for (int i = 0; i < 3; i++) {
+      corrected_accel[i] = kalmanFilter(&accel_filter[i], corrected_accel[i]);
+      corrected_gyro[i] = kalmanFilter(&gyro_filter[i], corrected_gyro[i]);
+    }
+  } else {
+    // 如果未校准，使用原始数据但应用卡尔曼滤波
+    corrected_accel[0] = kalmanFilter(&accel_filter[0], accel.acceleration.x);
+    corrected_accel[1] = kalmanFilter(&accel_filter[1], accel.acceleration.y);
+    corrected_accel[2] = kalmanFilter(&accel_filter[2], accel.acceleration.z);
+    
+    corrected_gyro[0] = kalmanFilter(&gyro_filter[0], gyro.gyro.x * 57.2958);
+    corrected_gyro[1] = kalmanFilter(&gyro_filter[1], gyro.gyro.y * 57.2958);
+    corrected_gyro[2] = kalmanFilter(&gyro_filter[2], gyro.gyro.z * 57.2958);
+  }
+  
+  // 填充结果结构
+  data.accelX = corrected_accel[0];
+  data.accelY = corrected_accel[1];
+  data.accelZ = corrected_accel[2];
+  data.gyroX = corrected_gyro[0];
+  data.gyroY = corrected_gyro[1];
+  data.gyroZ = corrected_gyro[2];
+  data.temperature = temp.temperature;
+  
+  return true;
+}
+
+float MPU6050Handler::kalmanFilter(KalmanFilter* filter, float measurement) {
+  // 预测步骤
+  filter->P = filter->P + filter->Q;
+  
+  // 更新步骤
+  filter->K = filter->P / (filter->P + filter->R);
+  filter->X = filter->X + filter->K * (measurement - filter->X);
+  filter->P = (1 - filter->K) * filter->P;
+  
+  return filter->X;
+}
+
+void MPU6050Handler::recoverSensor() {
+  // 1. 完全重置I2C总线
+  Wire.end();
+  delay(50);
+  Wire.begin();
+  delay(100);
+  
+  // 2. 重置传感器
+  mpu.begin(); // 尝试重新初始化
+  
+  // 3. 重置配置
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  
+  // 4. 清空可能存在的错误状态
+  for (int i = 0; i < 3; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp); // 读取并丢弃
+    delay(20);
+  }
+  
+  Serial.println("Recovery complete. Resuming data collection...");
+}
+
+文件：MPU6050_handler.h
+代码：
+#ifndef MPU6050_HANDLER_H
+#define MPU6050_HANDLER_H
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// 传感器数据结构
+struct SensorData {
+  float accelX;
+  float accelY;
+  float accelZ;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  float temperature;
+};
+
+class MPU6050Handler {
+public:
+  MPU6050Handler();
+  bool init();
+  bool readData(SensorData &data);
+  void recoverSensor();
+  void calibrate();
+  
+private:
+  Adafruit_MPU6050 mpu;
+  
+  // 零漂校正相关变量
+  bool isCalibrated;
+  float accel_offset[3];
+  float gyro_offset[3];
+  const int CALIBRATION_SAMPLES = 200;
+  
+  // 卡尔曼滤波器结构体
+  struct KalmanFilter {
+    float Q; // 过程噪声协方差
+    float R; // 测量噪声协方差
+    float P; // 估计误差协方差
+    float K; // 卡尔曼增益
+    float X; // 状态估计值
+  };
+  
+  KalmanFilter accel_filter[3];
+  KalmanFilter gyro_filter[3];
+  
+  void initKalmanFilters();
+  float kalmanFilter(KalmanFilter* filter, float measurement);
+};
+
+#endif
+
+文件：NeoPixel_handler.cpp
+代码：
+#include "NeoPixel_handler.h"
+#include <Arduino.h>
+
+NeoPixelHandler::NeoPixelHandler() 
+  : strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800), 
+    speedFactor(1.0), 
+    direction(1), // 默认正向
+    lastUpdateTime(0),
+    waveOffset(0.0) {
+}
+
+void NeoPixelHandler::init() {
+  strip.begin();
+  strip.setBrightness(50);  // 建议亮度50-100
+  strip.show();             // 初始化灯条
+}
+
+void NeoPixelHandler::update() {
+  // 根据速度因子计算更新间隔
+  unsigned long updateInterval = 30 / speedFactor; // 基础30ms延迟除以速度因子
+  
+  if (millis() - lastUpdateTime >= updateInterval) {
+    greenWaveEffect();
+    lastUpdateTime = millis();
+  }
+}
+
+void NeoPixelHandler::setSpeedFactor(float factor) {
+  // 限制速度因子在合理范围内
+  speedFactor = constrain(factor, 1.0, 3.0);
+}
+
+float NeoPixelHandler::getSpeedFactor() const {
+  return speedFactor;
+}
+
+// 设置灯条流动方向
+void NeoPixelHandler::setDirection(int dir) {
+  direction = (dir >= 0) ? 1 : -1; // 确保方向为1或-1
+}
+
+void NeoPixelHandler::greenWaveEffect() {
+  for (int i = 0; i < LED_COUNT; i++) {
+    // 计算每个灯珠的位置比例 (0.0~1.0)
+    float position = fmod((float)i / LED_COUNT + waveOffset, 1.0);
+    if (position < 0) position += 1.0; // 确保位置在0-1范围内
+    
+    // 根据位置选择颜色
+    uint32_t color;
+    if (position < 0.142) {          // 0-1/7 浅绿→绿
+      color = blendColors(LIGHT_GREEN, GREEN, position * 7);
+    } else if (position < 0.285) {   // 1/7-2/7 保持绿
+      color = GREEN;
+    } else if (position < 0.428) {   // 2/7-3/7 绿→墨绿
+      color = blendColors(GREEN, DARK_GREEN, (position - 0.285) * 7);
+    } else if (position < 0.571) {   // 3/7-4/7 墨绿→绿
+      color = blendColors(DARK_GREEN, GREEN, (position - 0.428) * 7);
+    } else if (position < 0.714) {   // 4/7-5/7 保持绿
+      color = GREEN;
+    } else {                         // 5/7-1.0 绿→浅绿
+      color = blendColors(GREEN, LIGHT_GREEN, (position - 0.714) * 7);
+    }
+    
+    strip.setPixelColor(i, color);
+  }
+  
+  strip.show();
+  
+  // 根据方向调整波形偏移量
+  // 减速时使用较小的速度因子，使反向流动速度变慢
+  float effectiveSpeed = speedFactor;
+  if (direction < 0) {
+    effectiveSpeed = speedFactor * REVERSE_SLOW_FACTOR;
+  }
+  
+  waveOffset += 0.02 * effectiveSpeed * direction;  // 方向影响波形移动方向
+  
+  // 确保偏移量在0-1范围内
+  if (waveOffset > 1.0) waveOffset -= 1.0;
+  if (waveOffset < 0.0) waveOffset += 1.0;
+}
+
+uint32_t NeoPixelHandler::blendColors(uint32_t color1, uint32_t color2, float ratio) {
+  if (ratio > 1.0) ratio = 1.0;
+  
+  uint8_t r1 = (color1 >> 16) & 0xFF;
+  uint8_t g1 = (color1 >> 8) & 0xFF;
+  uint8_t b1 = color1 & 0xFF;
+  
+  uint8_t r2 = (color2 >> 16) & 0xFF;
+  uint8_t g2 = (color2 >> 8) & 0xFF;
+  uint8_t b2 = color2 & 0xFF;
+  
+  uint8_t r = r1 + (r2 - r1) * ratio;
+  uint8_t g = g1 + (g2 - g1) * ratio;
+  uint8_t b = b1 + (b2 - b1) * ratio;
+  
+  return strip.Color(r, g, b);
+}
+
+文件：NeoPixel_handler.h
+代码：#ifndef NEOPIXEL_HANDLER_H
+#define NEOPIXEL_HANDLER_H
+
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN     6     // 数据线连接的Arduino引脚
+#define LED_COUNT   60    // 灯珠数量
+
+class NeoPixelHandler {
+public:
+  NeoPixelHandler();
+  void init();
+  void update();
+  void setSpeedFactor(float factor);
+  float getSpeedFactor() const;
+  void setDirection(int dir); // 设置方向
+  
+private:
+  Adafruit_NeoPixel strip;
+  float speedFactor;
+  int direction; // 流动方向 (1: 正向, -1: 反向)
+  unsigned long lastUpdateTime;
+  float waveOffset;
+  
+  // 绿色系颜色
+  const uint32_t LIGHT_GREEN = strip.Color(150, 255, 150);
+  const uint32_t GREEN = strip.Color(0, 255, 0);
+  const uint32_t DARK_GREEN = strip.Color(0, 50, 0);
+  
+  // 可配置参数 - 反向流动速度降低因子
+  const float REVERSE_SLOW_FACTOR = 0.7; // 反向流动时速度降低因子
+  
+  void greenWaveEffect();
+  uint32_t blendColors(uint32_t color1, uint32_t color2, float ratio);
+};
+
+#endif
